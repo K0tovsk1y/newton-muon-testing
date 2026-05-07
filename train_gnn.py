@@ -5,12 +5,38 @@ import torch_geometric.transforms as T
 from torch_geometric.nn import GCNConv
 import matplotlib.pyplot as plt
 import numpy as np
+import concurrent.futures
+import time
 
 from optimizers import MatrixOptimizer
-from utils import attach_z_hooks
+
+# ================= КОНФИГУРАЦИЯ =================
+FIXED_LR = 0.02      # Заданный LR
+NUM_WORKERS = 3      # Сколько параллельных процессов (чтобы не убить CPU)
+NUM_LAYERS = 3      # Глубина сети (стресс-тест)
+NUM_SEEDS = 12        # Сколько запусков на каждый оптимизатор
+EPOCHS = 300         
+# ================================================
+
+# ПРАВИЛЬНЫЙ ХУК ДЛЯ PYTORCH GEOMETRIC
+def attach_z_hooks(model: torch.nn.Module):
+    attached_count = 0
+    for name, module in model.named_modules():
+        # Цепляемся напрямую к графовому слою
+        if isinstance(module, GCNConv):
+            def pre_hook(mod, inputs):
+                # В GCNConv первый аргумент - это признаки узлов X
+                x = inputs[0].detach()
+                # Ищем 2D-веса внутри этого слоя и привязываем к ним Z
+                for p in mod.parameters():
+                    if p.ndim == 2:
+                        p.Z = x.T.float()
+            module.register_forward_pre_hook(pre_hook)
+            attached_count += 1
+    return attached_count
 
 class DeepGCN(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, num_layers=6):
+    def __init__(self, in_channels, hidden_channels, out_channels, num_layers):
         super().__init__()
         self.convs = torch.nn.ModuleList()
         self.convs.append(GCNConv(in_channels, hidden_channels, cached=True))
@@ -23,133 +49,139 @@ class DeepGCN(torch.nn.Module):
             x = conv(x, edge_index)
             if i < len(self.convs) - 1:
                 x = F.relu(x)
-                # Уменьшим dropout, чтобы лучше видеть чистый loss
-                x = F.dropout(x, p=0.2, training=self.training) 
+                x = F.dropout(x, p=0.2, training=self.training)
         return x
 
-def train_single_run(opt_name: str, lr: float, data, dataset, device):
-    torch.manual_seed(42) # Фиксируем сид для честности
-    model = DeepGCN(dataset.num_features, 128, dataset.num_classes, num_layers=6).to(device)
+def run_experiment(config):
+    opt_name, seed = config
+    start_time = time.time()
+    
+    device = torch.device('cuda:0')
+    dataset = Planetoid(root='/tmp/Cora', name='Cora', transform=T.NormalizeFeatures())
+    data = dataset[0].to(device)
+    
+    torch.manual_seed(seed)
+    model = DeepGCN(dataset.num_features, 128, dataset.num_classes, NUM_LAYERS).to(device)
     attach_z_hooks(model)
     
-    matrix_params = [p for n, p in model.named_parameters() if p.ndim == 2]
-    other_params = [p for n, p in model.named_parameters() if p.ndim != 2]
-
-    # AdamW для bias параметров
-    optimizer_other = torch.optim.AdamW(other_params, lr=0.01, weight_decay=5e-4)
+    m_params =[p for n, p in model.named_parameters() if p.ndim == 2]
+    o_params = [p for n, p in model.named_parameters() if p.ndim != 2]
+    opt_other = torch.optim.AdamW(o_params, lr=0.01)
 
     if opt_name == "AdamW":
-        optimizer_matrix = torch.optim.AdamW(matrix_params, lr=lr, weight_decay=5e-4)
-    elif opt_name == "Muon":
-        optimizer_matrix = MatrixOptimizer(matrix_params, lr=lr, use_newton=False)
-    elif opt_name == "Newton-Muon":
-        optimizer_matrix = MatrixOptimizer(matrix_params, lr=lr, use_newton=True)
-    
-    history = {'loss': [], 'val_acc': []}
-    best_val_acc = 0.0
+        opt_matrix = torch.optim.AdamW(m_params, lr=FIXED_LR)
+    else:
+        opt_matrix = MatrixOptimizer(
+            m_params, 
+            lr=FIXED_LR, 
+            use_newton=(opt_name == "Newton-Muon"),
+            nm_refresh_interval=5,  # Обновлять матрицу раз в 5 эпох (вернет скорость!)
+            nm_beta=0.5,            # Легкое сглаживание, чтобы K не "дергалась"
+            nm_gamma=2.0            # ОЧЕНЬ ВАЖНО: Увеличиваем ridge penalty!
+                                    # Это не даст Newton-Muon'у усиливать шум в 1000 раз.
+                                    # В статье (Figure 5) показано, что при росте gamma алгоритм
+                                    # становится более стабильным и приближается к стандартоному Muon.
+        )
 
-    model.train()
-    for epoch in range(1, 201):
-        optimizer_matrix.zero_grad()
-        optimizer_other.zero_grad()
+    history = {'loss': [], 'val_acc': [], 'cond_nums':[]}
+    
+    for epoch in range(EPOCHS):
+        model.train()
+        opt_matrix.zero_grad()
+        opt_other.zero_grad()
         
         out = model(data.x, data.edge_index)
         loss = F.cross_entropy(out[data.train_mask], data.y[data.train_mask])
         loss.backward()
         
-        optimizer_matrix.step()
-        optimizer_other.step()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        m_info = opt_matrix.step()
+        opt_other.step()
         
         history['loss'].append(loss.item())
         
-        # Считаем валидацию
+        # Если Newton-Muon вернул кондишн - сохраняем, иначе 1.0 (для AdamW и Muon)
+        if m_info and "cond_nums" in m_info and len(m_info["cond_nums"]) > 0:
+            history['cond_nums'].append(np.mean(m_info["cond_nums"]))
+        else:
+            history['cond_nums'].append(1.0)
+
         model.eval()
         with torch.no_grad():
             pred = model(data.x, data.edge_index).argmax(dim=-1)
-            val_acc = (pred[data.val_mask] == data.y[data.val_mask]).sum().item() / data.val_mask.sum().item()
-        model.train()
-        
-        history['val_acc'].append(val_acc)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+            acc = (pred[data.val_mask] == data.y[data.val_mask]).sum().item() / data.val_mask.sum().item()
+            history['val_acc'].append(acc)
             
-    return history, best_val_acc
-
-def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    dataset = Planetoid(root='/tmp/Cora', name='Cora', transform=T.NormalizeFeatures())
-    data = dataset[0].to(device)
-
-    # Задаем сетки поиска LR
-    grids = {
-        "AdamW": [0.001, 0.005, 0.01, 0.05],
-        # Muon и Newton-Muon часто требуют LR x5-x10 раз больше, чем Adam
-        "Muon": [0.01, 0.05, 0.1, 0.2, 0.5],
-        "Newton-Muon": [0.01, 0.05, 0.1, 0.2, 0.5]
-    }
-
-    best_results = {}
-
-    for opt_name, lr_list in grids.items():
-        print(f"\n--- Sweeping {opt_name} ---")
-        best_acc = 0
-        best_hist = None
-        best_lr = 0
-        
-        for lr in lr_list:
-            print(f"  Testing LR={lr}...")
-            hist, acc = train_single_run(opt_name, lr, data, dataset, device)
-            print(f"  -> Final Val Acc: {acc:.4f} (Final Loss: {hist['loss'][-1]:.4f})")
-            
-            if acc > best_acc:
-                best_acc = acc
-                best_hist = hist
-                best_lr = lr
-                
-        best_results[opt_name] = {
-            'hist': best_hist,
-            'lr': best_lr,
-            'acc': best_acc
-        }
-        print(f"[*] Best {opt_name}: LR={best_lr} with Val Acc={best_acc:.4f}")
-
-    # --- РИСУЕМ ГРАФИКИ ---
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    
-    colors = {'AdamW': 'blue', 'Muon': 'orange', 'Newton-Muon': 'green'}
-
-    for opt_name, res in best_results.items():
-        hist = res['hist']
-        label = f"{opt_name} (lr={res['lr']})"
-        
-        # Сглаживаем Loss для красоты (Exponential Moving Average)
-        losses = np.array(hist['loss'])
-        smoothed_losses = np.zeros_like(losses)
-        smoothed_losses[0] = losses[0]
-        for i in range(1, len(losses)):
-            smoothed_losses[i] = 0.9 * smoothed_losses[i-1] + 0.1 * losses[i]
-            
-        ax1.plot(smoothed_losses, label=label, color=colors[opt_name], alpha=0.8)
-        ax2.plot(hist['val_acc'], label=label, color=colors[opt_name], alpha=0.8)
-
-    ax1.set_title("Train Loss (Smoothed)")
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Loss")
-    ax1.set_yscale('log') # Логарифмическая шкала для лосса очень полезна!
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    ax2.set_title("Validation Accuracy")
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Accuracy")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    plt.savefig('gnn_results.png', dpi=300)
-    print("\n[+] Plot saved to gnn_results.png")
+    elapsed = time.time() - start_time
+    return opt_name, seed, history, elapsed
 
 if __name__ == '__main__':
-    main()
+    import torch.multiprocessing as mp
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
+    methods = ["AdamW", "Muon", "Newton-Muon"]
+    tasks =[(m, s) for m in methods for s in range(NUM_SEEDS)]
+
+    print(f"=== GNN Benchmark (LR={FIXED_LR}) ===")
+    print(f"Workers: {NUM_WORKERS} | Layers: {NUM_LAYERS} | Seeds: {NUM_SEEDS}")
+    print("-" * 75)
+
+    processed = {m: {'acc': [], 'loss': [], 'cond':[]} for m in methods}
+    
+    with concurrent.futures.ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = {executor.submit(run_experiment, task): task for task in tasks}
+        
+        for future in concurrent.futures.as_completed(futures):
+            opt_name, seed, hist, elapsed = future.result()
+            
+            processed[opt_name]['acc'].append(hist['val_acc'])
+            processed[opt_name]['loss'].append(hist['loss'])
+            processed[opt_name]['cond'].append(hist['cond_nums'])
+            
+            f_loss = hist['loss'][-1]
+            f_acc = hist['val_acc'][-1]
+            max_c = np.max(hist['cond_nums'])
+            
+            cond_str = f"| Max \u03BA: {max_c:.1e}" if opt_name == "Newton-Muon" else ""
+            print(f"[{opt_name:12}] Seed {seed} | {elapsed:>4.1f}s | Acc: {f_acc:.4f} | Loss: {f_loss:.4f} {cond_str}")
+
+    print("-" * 75)
+    print("Generating plot...")
+
+    # --- ВИЗУАЛИЗАЦИЯ ---
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 6))
+    fig.suptitle(f"GNN Benchmark (16 Layers) | Fixed LR = {FIXED_LR} | {NUM_SEEDS} Seeds", fontsize=16)
+    
+    colors = {'AdamW': 'blue', 'Muon': 'orange', 'Newton-Muon': 'green'}
+    epochs = np.arange(EPOCHS)
+    
+    for opt in methods:
+        data = processed[opt]
+        acc_m = np.mean(data['acc'], axis=0)
+        acc_s = np.std(data['acc'], axis=0)
+        loss_m = np.mean(data['loss'], axis=0)
+        cond_m = np.mean(data['cond'], axis=0)
+        
+        ax1.plot(epochs, loss_m, label=opt, color=colors[opt])
+        ax1.set_yscale('log'); ax1.set_title("Train Loss")
+        ax1.set_xlabel("Epoch"); ax1.set_ylabel("Loss"); ax1.legend()
+        
+        ax2.plot(epochs, acc_m, color=colors[opt], label=opt)
+        ax2.fill_between(epochs, acc_m-acc_s, acc_m+acc_s, color=colors[opt], alpha=0.15)
+        ax2.set_title("Val Accuracy")
+        ax2.set_xlabel("Epoch"); ax2.set_ylabel("Accuracy"); ax2.legend()
+        
+        # График Condition Number (только если это Newton-Muon и данные реальные)
+        if opt == "Newton-Muon" and not np.all(cond_m == 1.0):
+            ax3.plot(epochs, cond_m, color='red', label='Newton-Muon')
+            ax3.set_yscale('log')
+            ax3.set_title("Condition Number $kappa(Z Z^T + gamma I)$")
+            ax3.set_xlabel("Epoch"); ax3.legend()
+
+    plt.tight_layout()
+    filename = f'gnn_results_seeds_{NUM_SEEDS}_layers_{NUM_LAYERS}_epochs_{EPOCHS}_lr_{FIXED_LR}.png'
+    plt.savefig(filename, dpi=300)
+    print(f"[+] Plot successfully saved to {filename}")
