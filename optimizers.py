@@ -51,11 +51,15 @@ class MatrixOptimizer(Optimizer):
                 state = self.state[p]
                 
                 # Инициализация состояния
-                if len(state) == 0:
+                if 'momentum_buffer' not in state:
                     state['momentum_buffer'] = torch.zeros_like(grad)
-                    if group['use_newton']:
-                        state['K'] = None
-                        state['inv_K'] = None
+                
+                if group['use_newton'] and 'accum_K' not in state:
+                    state['K'] = None
+                    state['inv_K'] = None
+                    state['accum_K'] = None
+                    state['accum_count'] = 0
+                    state['precond_warmed_up'] = False
 
                 m, n = p.shape
 
@@ -65,70 +69,81 @@ class MatrixOptimizer(Optimizer):
                 if group['use_newton']:
                     if getattr(p, 'Z', None) is None:
                         if not self.missing_z_warned:
-                            print("\n[WARNING] Newton-Muon is active, but a weight parameter has no 'Z' attribute! Falling back to Muon.")
+                            print("\n[WARNING] Newton-Muon: no 'Z' attribute! Falling back to Muon.")
                             self.missing_z_warned = True
                     else:
                         Z = p.Z.to(torch.float32)
                         
                         if Z.ndim > 2:
-                            if Z.size(-1) == n:
-                                Z = Z.view(-1, n)
-                            elif Z.size(0) == n:
-                                Z = Z.view(n, -1)
-                            else:
-                                Z = Z.reshape(-1, Z.size(-1))
+                            Z = Z.view(-1, Z.size(-1)) if Z.size(-1) == n else Z.view(n, -1)
 
-                        # Умное вычисление ковариации
                         if Z.size(0) == n:    
-                            N_samples = Z.size(1)
-                            ZZT = torch.mm(Z, Z.T) / N_samples
+                            ZZT = torch.mm(Z, Z.T) / Z.size(1)
                         elif Z.size(1) == n:  
-                            N_samples = Z.size(0)
-                            ZZT = torch.mm(Z.T, Z) / N_samples
+                            ZZT = torch.mm(Z.T, Z) / Z.size(0)
                         else:
-                            raise ValueError(f"Shape mismatch: param is {p.shape}, but Z is {p.Z.shape}")
+                            raise ValueError(f"Shape mismatch: param is {p.shape}, Z is {p.Z.shape}")
                         
-                        beta = group['nm_beta']
+                        # 1. Накопление ZZT внутри интервала (БЕЗ применения EMA)
+                        if state['accum_K'] is None:
+                            state['accum_K'] = torch.zeros_like(ZZT)
                         
+                        state['accum_K'].add_(ZZT)
+                        state['accum_count'] += 1
+
+                        # 2. Инициализация K и inv_K на самом первом шаге
                         if state['K'] is None:
                             state['K'] = 1e-3 * torch.eye(n, device=grad.device, dtype=torch.float32)
+                            # Изначально предобуславливатель - это единичная матрица (действует как обычный Muon)
+                            state['inv_K'] = torch.eye(n, device=grad.device, dtype=grad.dtype)
+
+                        # 3. Обновление EMA и обратной матрицы ТОЛЬКО раз в refresh_interval
+                        if (self._step_count + 1) % group['nm_refresh_interval'] == 0:
+                            beta = group['nm_beta']
                             
-                        # Накапливаем историю (EMA)
-                        state['K'].mul_(beta).add_(ZZT, alpha=1 - beta)
+                            # Усредненный ZZT за последние k шагов
+                            avg_ZZT = state['accum_K'] / max(state['accum_count'], 1)
                             
-                        # Обновление обратной матрицы
-                        if self._step_count % group['nm_refresh_interval'] == 0 or state['inv_K'] is None:
+                            # Применяем EMA один раз за интервал (согласно Алгоритму 1)
+                            state['K'].lerp_(avg_ZZT, 1.0 - beta)
+                            
+                            # Сброс аккумуляторов
+                            state['accum_K'].zero_()
+                            state['accum_count'] = 0
+
                             K = state['K']
                             trace = torch.trace(K)
                             
-                            # Добавлен + 1e-8 для защиты от сингулярности в начале обучения
                             gamma_val = group['nm_gamma'] * (trace / n) + 1e-8
                             K_damped = K + gamma_val * torch.eye(n, device=K.device)
                             
+                            # 4. БЕЗОПАСНЫЙ Cholesky Inverse (со 100% совпадением с оф. кодом)
                             try:
                                 L, info = torch.linalg.cholesky_ex(K_damped)
                                 if info.item() == 0:
                                     inv_K = torch.cholesky_inverse(L).to(grad.dtype)
                                 else:
-                                    inv_K = torch.linalg.inv(K_damped).to(grad.dtype)
+                                    # FALLBACK: Возвращаемся к единичной матрице, если сингулярна!
+                                    inv_K = torch.eye(n, device=grad.device, dtype=grad.dtype)
                             except Exception:
-                                inv_K = torch.linalg.inv(K_damped).to(grad.dtype)
+                                inv_K = torch.eye(n, device=grad.device, dtype=grad.dtype)
                                 
                             state['inv_K'] = inv_K
                             
+                            # Сбор метрик (опционально)
                             try:
                                 L_eig = torch.linalg.eigvalsh(K_damped.to(torch.float64))
-                                cond = (L_eig[-1] / torch.clamp(L_eig[0], min=1e-15)).item()
-                                state['last_cond'] = cond
-                            except Exception:
+                                state['last_cond'] = (L_eig[-1] / torch.clamp(L_eig[0], min=1e-15)).item()
+                            except:
                                 state['last_cond'] = float('inf')
 
-                        # Предобуславливание
+                        # Применение предобуславливателя (если он готов)
                         if state['inv_K'] is not None:
-                            grad_f32 = grad.to(torch.float32)
-                            grad = (grad_f32 @ state['inv_K'].to(torch.float32)).to(grad.dtype)
+                            grad = (grad.to(torch.float32) @ state['inv_K'].to(torch.float32)).to(grad.dtype)
+                            
                         if 'last_cond' in state:
                             metrics["cond_nums"].append(state['last_cond'])
+
 
                 # =====================================================
                 # СТАНДАРТНЫЙ MUON PIPELINE

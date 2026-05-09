@@ -13,10 +13,10 @@ from optimizers import MatrixOptimizer
 # ================= КОНФИГУРАЦИЯ =================
 ADAM_LR = 0.01       
 MUON_LR = 0.002      
-NUM_WORKERS = 3      
+NUM_WORKERS = 3
 NUM_LAYERS = 6      
-NUM_SEEDS = 11        
-EPOCHS = 300         
+NUM_SEEDS = 25        
+EPOCHS = 100         
 # ================================================
 
 def attach_z_hooks(model: torch.nn.Module):
@@ -74,8 +74,8 @@ def run_experiment(config):
             m_params, 
             lr=MUON_LR, 
             use_newton=(opt_name == "Newton-Muon"),
-            nm_refresh_interval=32, 
-            nm_beta=0.95,           
+            nm_refresh_interval=32,  # Для Full-batch графов нужно частое обновление!
+            nm_beta=0.95,           # Меньше инерция для быстрой реакции     
             nm_gamma=0.2            
         )
 
@@ -118,8 +118,8 @@ if __name__ == '__main__':
     except RuntimeError:
         pass
 
-    methods =["AdamW", "Muon", "Newton-Muon"]
-    tasks =[(m, s) for m in methods for s in range(NUM_SEEDS)]
+    methods = ["AdamW", "Muon", "Newton-Muon"]
+    tasks = [(m, s) for m in methods for s in range(NUM_SEEDS)]
 
     print(f"=== GNN Benchmark ===")
     print(f"AdamW LR: {ADAM_LR} | Muon LR: {MUON_LR}")
@@ -146,15 +146,49 @@ if __name__ == '__main__':
             print(f"[{opt_name:12}] Seed {seed:02d} | {elapsed:>4.1f}s | Acc: {f_acc:.4f} | Loss: {f_loss:.4f} {cond_str}")
 
     print("-" * 75)
-    print("Generating plot...")
+    print("Computing statistics and generating plot...")
 
-    # --- ВИЗУАЛИЗАЦИЯ ---
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 6))
-    fig.suptitle(f"GNN Benchmark ({NUM_LAYERS} Layers) | Adam LR={ADAM_LR}, Muon LR={MUON_LR} | {NUM_SEEDS} Seeds", fontsize=16)
+    # ================= РАСЧЕТ СТАТИСТИКИ =================
+    summary_stats = []
     
-    colors = {'AdamW': 'blue', 'Muon': 'orange', 'Newton-Muon': 'green'}
+    def calc_mean_ci(data_array):
+        # 95% Confidence Interval
+        mean = np.mean(data_array)
+        ci = 1.96 * np.std(data_array) / np.sqrt(len(data_array))
+        return mean, ci
+
+    for opt in methods:
+        acc_matrix = np.array(processed[opt]['acc']) # [NUM_SEEDS, EPOCHS]
+        
+        # 1. AUC (Normalized) - Насколько быстро растет график
+        auc_per_seed = np.trapz(acc_matrix, axis=1) / (EPOCHS - 1)
+        auc_m, auc_ci = calc_mean_ci(auc_per_seed)
+        
+        # 2. Best Accuracy - Пиковая точность
+        best_per_seed = np.max(acc_matrix, axis=1)
+        best_m, best_ci = calc_mean_ci(best_per_seed)
+        
+        # 3. Final Accuracy - Точность в конце (нет ли деградации)
+        final_per_seed = acc_matrix[:, -1]
+        final_m, final_ci = calc_mean_ci(final_per_seed)
+        
+        summary_stats.append([
+            opt,
+            f"{auc_m:.4f} ± {auc_ci:.4f}",
+            f"{best_m:.4f} ± {best_ci:.4f}",
+            f"{final_m:.4f} ± {final_ci:.4f}"
+        ])
+
+    # ================= ВИЗУАЛИЗАЦИЯ (Сетка 2x2) =================
+    fig, axs = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle(f"GNN Benchmark ({NUM_LAYERS} Layers) | {NUM_SEEDS} Seeds", fontsize=18, y=0.95)
+    
+    colors = {'AdamW': '#1f77b4', 'Muon': '#ff7f0e', 'Newton-Muon': '#2ca02c'}
     epochs = np.arange(EPOCHS)
     
+    ax_loss, ax_acc = axs[0, 0], axs[0, 1]
+    ax_cond, ax_tbl = axs[1, 0], axs[1, 1]
+
     for opt in methods:
         data = processed[opt]
         acc_m = np.mean(data['acc'], axis=0)
@@ -162,25 +196,57 @@ if __name__ == '__main__':
         loss_m = np.mean(data['loss'], axis=0)
         cond_m = np.mean(data['cond'], axis=0)
         
-        ax1.plot(epochs, loss_m, label=opt, color=colors[opt], linewidth=2)
-        ax1.set_yscale('log'); ax1.set_title("Train Loss")
-        ax1.set_xlabel("Epoch"); ax1.set_ylabel("Loss"); ax1.legend()
-        ax1.grid(True, which="both", ls="-", alpha=0.2)
+        # Plot Loss
+        ax_loss.plot(epochs, loss_m, label=opt, color=colors[opt], linewidth=2)
         
-        ax2.plot(epochs, acc_m, color=colors[opt], label=opt, linewidth=2)
-        ax2.fill_between(epochs, acc_m-acc_s, acc_m+acc_s, color=colors[opt], alpha=0.15)
-        ax2.set_title("Val Accuracy")
-        ax2.set_xlabel("Epoch"); ax2.set_ylabel("Accuracy"); ax2.legend()
-        ax2.grid(True, alpha=0.3)
+        # Plot Acc
+        ax_acc.plot(epochs, acc_m, color=colors[opt], label=opt, linewidth=2)
+        ax_acc.fill_between(epochs, acc_m-acc_s, acc_m+acc_s, color=colors[opt], alpha=0.15)
         
+        # Plot Cond (Only Newton-Muon usually has non-trivial condition numbers)
         if opt == "Newton-Muon" and not np.all(cond_m == 1.0):
-            ax3.plot(epochs, cond_m, color='red', label='Newton-Muon')
-            ax3.set_yscale('log')
-            ax3.set_title("Condition Number $kappa(Z Z^T + gamma I)$")
-            ax3.set_xlabel("Epoch"); ax3.legend()
-            ax3.grid(True, which="both", ls="-", alpha=0.2)
+            ax_cond.plot(epochs, cond_m, color='red', label='Newton-Muon')
 
-    plt.tight_layout()
-    filename = f'gnn_results_corrected.png'
-    plt.savefig(filename, dpi=300)
-    print(f"[+] Plot successfully saved to {filename}")
+    # Formatting axes
+    ax_loss.set_yscale('log')
+    ax_loss.set_title("Train Loss", fontsize=14)
+    ax_loss.set_xlabel("Epoch"); ax_loss.set_ylabel("Loss")
+    ax_loss.grid(True, which="both", ls="--", alpha=0.5)
+    ax_loss.legend()
+
+    ax_acc.set_title("Validation Accuracy", fontsize=14)
+    ax_acc.set_xlabel("Epoch"); ax_acc.set_ylabel("Accuracy")
+    ax_acc.grid(True, ls="--", alpha=0.5)
+    ax_acc.legend()
+
+    ax_cond.set_yscale('log')
+    ax_cond.set_title(r'Condition Number $\kappa(Z Z^T + \gamma I)$', fontsize=14)
+    ax_cond.set_xlabel("Epoch")
+    ax_cond.grid(True, which="both", ls="--", alpha=0.5)
+    ax_cond.legend()
+
+    # Построение таблицы статистики
+    ax_tbl.axis('off')
+    ax_tbl.set_title("Performance Metrics (95% CI)", fontsize=14, pad=20)
+    
+    col_labels = ["Optimizer", "AUC (Conv. Speed)", "Best Acc", "Final Acc"]
+    table = ax_tbl.table(cellText=summary_stats, 
+                         colLabels=col_labels, 
+                         loc='center', 
+                         cellLoc='center')
+    
+    # Стилизация таблицы
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1.2, 2.5) # Ширина, Высота ячеек
+    
+    # Выделяем заголовки таблицы жирным
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight='bold')
+            cell.set_facecolor('#f0f0f0')
+
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    filename = f'gnn_results_stats_adam_{ADAM_LR}_muon_{MUON_LR}.png'
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    print(f"\n[+] Statistical plot successfully saved to {filename}")
