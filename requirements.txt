@@ -1,0 +1,9 @@
+# Базовые библиотеки
+numpy>=1.24.0
+matplotlib>=3.7.0
+
+# PyTorch (Требуется версия >= 2.0 для работы torch.compile и torch.linalg.cholesky_ex)
+torch>=2.1.0
+
+# Графовые нейросети (PyTorch Geometric)
+torch-geometric>=2.3.0
