@@ -11,23 +11,20 @@ import time
 from optimizers import MatrixOptimizer
 
 # ================= КОНФИГУРАЦИЯ =================
-FIXED_LR = 0.02      # Заданный LR
-NUM_WORKERS = 3      # Сколько параллельных процессов (чтобы не убить CPU)
-NUM_LAYERS = 3      # Глубина сети (стресс-тест)
-NUM_SEEDS = 12        # Сколько запусков на каждый оптимизатор
+ADAM_LR = 0.01       
+MUON_LR = 0.002      
+NUM_WORKERS = 3      
+NUM_LAYERS = 6      
+NUM_SEEDS = 11        
 EPOCHS = 300         
 # ================================================
 
-# ПРАВИЛЬНЫЙ ХУК ДЛЯ PYTORCH GEOMETRIC
 def attach_z_hooks(model: torch.nn.Module):
     attached_count = 0
     for name, module in model.named_modules():
-        # Цепляемся напрямую к графовому слою
         if isinstance(module, GCNConv):
             def pre_hook(mod, inputs):
-                # В GCNConv первый аргумент - это признаки узлов X
                 x = inputs[0].detach()
-                # Ищем 2D-веса внутри этого слоя и привязываем к ним Z
                 for p in mod.parameters():
                     if p.ndim == 2:
                         p.Z = x.T.float()
@@ -56,7 +53,7 @@ def run_experiment(config):
     opt_name, seed = config
     start_time = time.time()
     
-    device = torch.device('cuda:0')
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     dataset = Planetoid(root='/tmp/Cora', name='Cora', transform=T.NormalizeFeatures())
     data = dataset[0].to(device)
     
@@ -64,26 +61,25 @@ def run_experiment(config):
     model = DeepGCN(dataset.num_features, 128, dataset.num_classes, NUM_LAYERS).to(device)
     attach_z_hooks(model)
     
-    m_params =[p for n, p in model.named_parameters() if p.ndim == 2]
+    m_params = [p for n, p in model.named_parameters() if p.ndim == 2]
     o_params = [p for n, p in model.named_parameters() if p.ndim != 2]
-    opt_other = torch.optim.AdamW(o_params, lr=0.01)
+    
+    # Нематричные параметры всегда обучаем AdamW
+    opt_other = torch.optim.AdamW(o_params, lr=ADAM_LR)
 
     if opt_name == "AdamW":
-        opt_matrix = torch.optim.AdamW(m_params, lr=FIXED_LR)
+        opt_matrix = torch.optim.AdamW(m_params, lr=ADAM_LR)
     else:
         opt_matrix = MatrixOptimizer(
             m_params, 
-            lr=FIXED_LR, 
+            lr=MUON_LR, 
             use_newton=(opt_name == "Newton-Muon"),
-            nm_refresh_interval=5,  # Обновлять матрицу раз в 5 эпох (вернет скорость!)
-            nm_beta=0.5,            # Легкое сглаживание, чтобы K не "дергалась"
-            nm_gamma=2.0            # ОЧЕНЬ ВАЖНО: Увеличиваем ridge penalty!
-                                    # Это не даст Newton-Muon'у усиливать шум в 1000 раз.
-                                    # В статье (Figure 5) показано, что при росте gamma алгоритм
-                                    # становится более стабильным и приближается к стандартоному Muon.
+            nm_refresh_interval=32, 
+            nm_beta=0.95,           
+            nm_gamma=0.2            
         )
 
-    history = {'loss': [], 'val_acc': [], 'cond_nums':[]}
+    history = {'loss':[], 'val_acc': [], 'cond_nums':[]}
     
     for epoch in range(EPOCHS):
         model.train()
@@ -100,11 +96,11 @@ def run_experiment(config):
         
         history['loss'].append(loss.item())
         
-        # Если Newton-Muon вернул кондишн - сохраняем, иначе 1.0 (для AdamW и Muon)
         if m_info and "cond_nums" in m_info and len(m_info["cond_nums"]) > 0:
             history['cond_nums'].append(np.mean(m_info["cond_nums"]))
         else:
-            history['cond_nums'].append(1.0)
+            last_val = history['cond_nums'][-1] if len(history['cond_nums']) > 0 else 1.0
+            history['cond_nums'].append(last_val)
 
         model.eval()
         with torch.no_grad():
@@ -122,10 +118,11 @@ if __name__ == '__main__':
     except RuntimeError:
         pass
 
-    methods = ["AdamW", "Muon", "Newton-Muon"]
+    methods =["AdamW", "Muon", "Newton-Muon"]
     tasks =[(m, s) for m in methods for s in range(NUM_SEEDS)]
 
-    print(f"=== GNN Benchmark (LR={FIXED_LR}) ===")
+    print(f"=== GNN Benchmark ===")
+    print(f"AdamW LR: {ADAM_LR} | Muon LR: {MUON_LR}")
     print(f"Workers: {NUM_WORKERS} | Layers: {NUM_LAYERS} | Seeds: {NUM_SEEDS}")
     print("-" * 75)
 
@@ -146,14 +143,14 @@ if __name__ == '__main__':
             max_c = np.max(hist['cond_nums'])
             
             cond_str = f"| Max \u03BA: {max_c:.1e}" if opt_name == "Newton-Muon" else ""
-            print(f"[{opt_name:12}] Seed {seed} | {elapsed:>4.1f}s | Acc: {f_acc:.4f} | Loss: {f_loss:.4f} {cond_str}")
+            print(f"[{opt_name:12}] Seed {seed:02d} | {elapsed:>4.1f}s | Acc: {f_acc:.4f} | Loss: {f_loss:.4f} {cond_str}")
 
     print("-" * 75)
     print("Generating plot...")
 
     # --- ВИЗУАЛИЗАЦИЯ ---
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(21, 6))
-    fig.suptitle(f"GNN Benchmark (16 Layers) | Fixed LR = {FIXED_LR} | {NUM_SEEDS} Seeds", fontsize=16)
+    fig.suptitle(f"GNN Benchmark ({NUM_LAYERS} Layers) | Adam LR={ADAM_LR}, Muon LR={MUON_LR} | {NUM_SEEDS} Seeds", fontsize=16)
     
     colors = {'AdamW': 'blue', 'Muon': 'orange', 'Newton-Muon': 'green'}
     epochs = np.arange(EPOCHS)
@@ -165,23 +162,25 @@ if __name__ == '__main__':
         loss_m = np.mean(data['loss'], axis=0)
         cond_m = np.mean(data['cond'], axis=0)
         
-        ax1.plot(epochs, loss_m, label=opt, color=colors[opt])
+        ax1.plot(epochs, loss_m, label=opt, color=colors[opt], linewidth=2)
         ax1.set_yscale('log'); ax1.set_title("Train Loss")
         ax1.set_xlabel("Epoch"); ax1.set_ylabel("Loss"); ax1.legend()
+        ax1.grid(True, which="both", ls="-", alpha=0.2)
         
-        ax2.plot(epochs, acc_m, color=colors[opt], label=opt)
+        ax2.plot(epochs, acc_m, color=colors[opt], label=opt, linewidth=2)
         ax2.fill_between(epochs, acc_m-acc_s, acc_m+acc_s, color=colors[opt], alpha=0.15)
         ax2.set_title("Val Accuracy")
         ax2.set_xlabel("Epoch"); ax2.set_ylabel("Accuracy"); ax2.legend()
+        ax2.grid(True, alpha=0.3)
         
-        # График Condition Number (только если это Newton-Muon и данные реальные)
         if opt == "Newton-Muon" and not np.all(cond_m == 1.0):
             ax3.plot(epochs, cond_m, color='red', label='Newton-Muon')
             ax3.set_yscale('log')
             ax3.set_title("Condition Number $kappa(Z Z^T + gamma I)$")
             ax3.set_xlabel("Epoch"); ax3.legend()
+            ax3.grid(True, which="both", ls="-", alpha=0.2)
 
     plt.tight_layout()
-    filename = f'gnn_results_seeds_{NUM_SEEDS}_layers_{NUM_LAYERS}_epochs_{EPOCHS}_lr_{FIXED_LR}.png'
+    filename = f'gnn_results_corrected.png'
     plt.savefig(filename, dpi=300)
     print(f"[+] Plot successfully saved to {filename}")
