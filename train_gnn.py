@@ -20,10 +20,10 @@ CONFIG = {
     "ADAM_LR": 0.01,
     "MUON_LR": 0.002,
     "NUM_WORKERS": 3,
-    "NUM_LAYERS": 5,
+    "NUM_LAYERS": 3,
     "HIDDEN_DIM": 128,
     "NUM_SEEDS": 50,
-    "EPOCHS": 120,
+    "EPOCHS": 160,
     "WEIGHT_DECAY": 0.01,
     "DROPOUT": 0.2,
     
