@@ -7,3 +7,5 @@ torch>=2.1.0
 
 # Графовые нейросети (PyTorch Geometric)
 torch-geometric>=2.3.0
+
+#у меня стоят numpy 2.2.6,torch 2.11.0+cu130,matplotlib 3.10.9, torch-geometric 2.7.0
