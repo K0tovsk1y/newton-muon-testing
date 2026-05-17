@@ -420,6 +420,18 @@ class Muon(torch.optim.Optimizer):
                 st["precond_inv_apply"][sub].copy_(inv_i)
 
     def step(self):
+        # === DEBUG: проверка градиентов перед opt.step ===
+        if self.global_step < 3:
+            for gi, group in enumerate(self.param_groups):
+                for pi, p in enumerate(group['params']):
+                    if p.grad is None:
+                        continue
+                    if not torch.isfinite(p.grad).all():
+                        print(f"[DBG step={self.global_step}] NaN/Inf в grad группы {gi}, param {pi}, shape={tuple(p.shape)}, "
+                              f"min={p.grad.min().item():.3e} max={p.grad.max().item():.3e}", flush=True)
+                    if not torch.isfinite(p.data).all():
+                        print(f"[DBG step={self.global_step}] NaN/Inf уже в p.data до opt — group {gi}, param {pi}, shape={tuple(p.shape)}", flush=True)
+
         do_refresh, precond_ewma, lr_mult = self._regime_schedule_(self.global_step)
         since = max(0, int(self.global_step) - int(self._regime_step))
         t = since + 1
@@ -432,9 +444,18 @@ class Muon(torch.optim.Optimizer):
                 stref["accum"].zero_()
                 stref["count"].zero_()
             if self.use_path_interval:
-                self._accum_path = 0.0  # сбрасываем после refresh
+                self._accum_path = 0.0
 
         self._apply_precond_all_grads_batched_()
+
+        # === DEBUG: проверка градиентов после preconditioner ===
+        if self.global_step < 3:
+            for gi, group in enumerate(self.param_groups):
+                for pi, p in enumerate(group['params']):
+                    if p.grad is None:
+                        continue
+                    if not torch.isfinite(p.grad).all():
+                        print(f"[DBG step={self.global_step} after_apply_precond] NaN/Inf в grad group {gi}, p {pi}", flush=True)
 
         for group in self.param_groups:
             lr = group['lr'] * lr_mult
@@ -453,18 +474,33 @@ class Muon(torch.optim.Optimizer):
                 if group['nesterov']:
                     g = g.add(buf, alpha=momentum)
 
+                # === DEBUG: после momentum, до newton-schulz ===
+                if self.global_step < 3 and not torch.isfinite(g).all():
+                    print(f"[DBG step={self.global_step}] NaN/Inf после momentum, shape={tuple(p.shape)}", flush=True)
+
                 if g.size(0) == 3 * g.size(1):
                     g = torch.cat([zeropower_via_newtonschulz5(g1, steps=steps) for g1 in g.split(g.size(1))])
                     scale = g.size(1)**0.5
                 else:
                     g = zeropower_via_newtonschulz5(g, steps=steps)
                     scale = max(g.size(0), g.size(1))**0.5
+
+                # === DEBUG: после newton-schulz ===
+                if self.global_step < 3 and not torch.isfinite(g).all():
+                    print(f"[DBG step={self.global_step}] NaN/Inf ПОСЛЕ newton_schulz, shape={tuple(p.shape)}, "
+                          f"min={g.min().item():.3e} max={g.max().item():.3e}", flush=True)
+
                 p.data.add_(g, alpha=-lr * scale)
 
-        # накопленный путь = сумма реально применённого lr (с учётом scheduler).
-        # path_threshold подбирается под средний lr (см. instantiation).
+                # === DEBUG: после применения update ===
+                if self.global_step < 3 and not torch.isfinite(p.data).all():
+                    print(f"[DBG step={self.global_step}] NaN/Inf в p.data ПОСЛЕ update, shape={tuple(p.shape)}, "
+                          f"lr={lr:.3e}, scale={scale:.3e}", flush=True)
+
         self._accum_path += float(self.param_groups[0]['lr'])
         self.global_step += 1
+        if self.global_step <= 3:
+            print(f"[DBG step={self.global_step-1}] завершён, _accum_path={self._accum_path:.4f}", flush=True)
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
@@ -763,16 +799,12 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
                                weight_decay=args.weight_decay, fused=True)
 optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95,
-                  # NM-both: Frob γ + path-based refresh одновременно.
-                  # threshold=0.013: на плато тот же rate что у авторов (refresh каждые 32),
-                  # на warmdown — реже (см. _interval.py).
-                  # ridge_mult=0.02: Frob-эквивалент trace=0.2 со scale ÷10
-                  # (мини-трансформер дал оптимум 0.005-0.03 для Frob).
-                  # ОСТОРОЖНО: на мини-трансформере NM-both проиграл NM-base (t=2.95), но
-                  # тогда threshold был агрессивный 0.40 — сейчас 0.013 консервативнее.
-                  use_frob_gamma=True, use_path_interval=True,
-                  precond_ridge_mult=0.02,
-                  path_threshold=0.013)
+                  # DEBUG: все наши флаги ВЫКЛЮЧЕНЫ (use_frob_gamma=False, use_path_interval=False)
+                  # — но Muon класс всё ещё содержит наши правки (новые attrs, _accum_path += lr).
+                  # Если NaN всё ещё появится — баг в нашем _accum_path/state, а не в Frob/path-branch.
+                  # Если NaN не появится — баг именно во Frob/path логике.
+                  use_frob_gamma=False,
+                  use_path_interval=False)
 optimizer2.attach_preconditioner()
 optimizers = [optimizer1, optimizer2]
 

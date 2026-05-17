@@ -11,7 +11,7 @@ import numpy as np
 import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
-from triton_kernels import XXT, ba_plus_cAA
+#from triton_kernels import XXT, ba_plus_cAA
 
 # -----------------------------------------------------------------------------
 # Custom operators: activation XtX accumulation (for preconditioner)
@@ -19,23 +19,24 @@ from triton_kernels import XXT, ba_plus_cAA
 def _dummy_scalar_like(x: torch.Tensor) -> torch.Tensor:
     return x.new_empty(())
 
-# compile once at module scope (do not define @torch.compile inside the custom op call path)
+# compile once at module scope (do not define #@torch.compile inside the custom op call path)
+##@torch.compile
 @torch.compile
 def _accum_xtx_impl(x_2d: Tensor, accum: Tensor, count: Tensor, tmp: Tensor) -> Tensor:
-    A = x_2d.transpose(0, 1)
-    XXT(A, out=tmp)
+    # Вместо XXT используем стандартный matmul
+    # x_2d имеет форму [N, D], нам нужно D x D (x_2d.T @ x_2d)
+    torch.mm(x_2d.T, x_2d, out=tmp) 
     tmp.mul_(1.0 / x_2d.size(0))
     accum.add_(tmp)
     count.add_(1.0)
     return _dummy_scalar_like(accum)
-
 @torch.compile
 def _accum_xtx_blocks4_impl(x_2d: Tensor, accum: Tensor, count: Tensor, tmp: Tensor) -> Tensor:
     N, fourD = x_2d.shape
-    assert fourD % 4 == 0
     D = fourD // 4
-    A = x_2d.view(N, 4, D).permute(1, 2, 0)  # [4, D, N]
-    XXT(A, out=tmp)
+    # Разрезаем на 4 блока и считаем батчем [4, N, D]
+    A = x_2d.view(N, 4, D).permute(1, 0, 2)
+    torch.bmm(A.transpose(1, 2), A, out=tmp)
     tmp.mul_(1.0 / N)
     accum.add_(tmp)
     count.add_(1.0)
@@ -62,37 +63,26 @@ def accum_xtx_blocks4_fake(x_2d: Tensor, accum: Tensor, count: Tensor, tmp: Tens
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
+#@torch.compile
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G.
-    """
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
-
-    X = G.bfloat16() / (G.norm() + eps)  # ensure top singular value <= 1
-    transposed = False
+    
+    # Нормализация
+    X = G.bfloat16() / (G.norm() + eps)
     if G.size(0) > G.size(1):
         X = X.T
-        transposed = True
-
-    X = X.contiguous()
-
-    m = X.size(0)
-    A = torch.empty((m, m), device=X.device, dtype=X.dtype)
-    B = torch.empty_like(A)
-    C = torch.empty_like(X)
-
+        
     for _ in range(steps):
-        XXT(X, out=A)
-        ba_plus_cAA(A, beta=b, alpha=c, out=B)
-        torch.mm(B, X, out=C)
-        C.add_(X, alpha=a)
-        X, C = C, X
-
-    if transposed:
-        X = X.T
-    return X.to(G.dtype)
+        A = torch.mm(X, X.T)
+        # Формула: B = c*A^2 + b*A
+        # В Тритоне это ba_plus_cAA, здесь - обычный mm
+        B = torch.addmm(A.mul(b), A, A, alpha=c)
+        # X = X + X @ B + a * X (упрощенно)
+        X = torch.addmm(X.mul(a), B, X)
+        
+    return X.T.to(G.dtype) if G.size(0) > G.size(1) else X.to(G.dtype)
 
 class Muon(torch.optim.Optimizer):
     """
@@ -111,7 +101,6 @@ class Muon(torch.optim.Optimizer):
         self, params, lr=3e-4, momentum=0.95, nesterov=True, backend_steps=5,
         precond_init_diag: float = 0.001, precond_ridge_mult: float = 0.2, precond_eps: float = 1e-8,
         lr_mult_max: float = 1.0, lr_mult_ramp_steps: int = 32,
-        use_frob_gamma: bool = False, use_path_interval: bool = False, path_threshold: float = 0.013,
     ):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend_steps=backend_steps)
         super().__init__(params, defaults)
@@ -121,12 +110,6 @@ class Muon(torch.optim.Optimizer):
         self.precond_eps = float(precond_eps)
         self.lr_mult_max = float(lr_mult_max)
         self.lr_mult_ramp_steps = int(lr_mult_ramp_steps)
-
-        # --- НАШИ модификации ---
-        self.use_frob_gamma = bool(use_frob_gamma)
-        self.use_path_interval = bool(use_path_interval)
-        self.path_threshold = float(path_threshold)
-        self._accum_path = 0.0
 
         self.global_step = 0
         self._regime_step = 0
@@ -141,10 +124,7 @@ class Muon(torch.optim.Optimizer):
     def _regime_schedule_(self, step: int) -> tuple[bool, float, float]:
         since = max(0, int(step) - int(self._regime_step))
         t = since + 1
-        if self.use_path_interval:
-            do_refresh = (self._accum_path >= self.path_threshold) and (step > 0)
-        else:
-            do_refresh = (t % 32 == 0)
+        do_refresh = (t % 32 == 0)
         precond_ewma = 0.950
 
         ramp = float(self.lr_mult_ramp_steps)
@@ -207,8 +187,22 @@ class Muon(torch.optim.Optimizer):
         plan = self._apply_plan
         if plan is None:
             return
-        d = plan["d"]
+            
+        # Этот параметр должен строго совпадать с eps из _refresh_precond_all_batched_
+        eps = 1e-5 
 
+        def apply_woodbury_batched(G, V, D):
+            """
+            Применяет тождество Вудбери для быстрого правого предобуславливания.
+            Формула: G_new = (G - (G @ V) * D @ V.T) / eps
+            Размерности: G: [B, m, d], V: [B, d, k], D: [B, k]
+            """
+            GV = torch.bmm(G, V)                # [B, m, k]
+            GVD = GV * D.unsqueeze(1)           # [B, m, k] (broadcasting по размерности m)
+            correction = torch.bmm(GVD, V.mT)   # [B, m, d]
+            return (G - correction) / eps
+
+        # --- 1. QKV Projections ---
         if plan["g_qkv"] is not None:
             G = plan["g_qkv"]
             for i, p in enumerate(plan["qkv_params"]):
@@ -216,11 +210,15 @@ class Muon(torch.optim.Optimizer):
                     G[i].zero_()
                 else:
                     G[i].copy_(p.grad, non_blocking=True)
-            torch.bmm(G, plan["inv_qkv"], out=G)
+            
+            # Применяем Вудбери: вычисление за O(m*d*k) вместо O(m*d*d)
+            G_new = apply_woodbury_batched(G, plan["V_qkv"], plan["D_qkv"])
+            
             for i, p in enumerate(plan["qkv_params"]):
                 if p.grad is not None:
-                    p.grad.copy_(G[i], non_blocking=True)
+                    p.grad.copy_(G_new[i], non_blocking=True)
 
+        # --- 2. Output Projections ---
         if plan["g_o"] is not None:
             G = plan["g_o"]
             for i, p in enumerate(plan["o_params"]):
@@ -228,11 +226,14 @@ class Muon(torch.optim.Optimizer):
                     G[i].zero_()
                 else:
                     G[i].copy_(p.grad, non_blocking=True)
-            torch.bmm(G, plan["inv_o"], out=G)
+            
+            G_new = apply_woodbury_batched(G, plan["V_o"], plan["D_o"])
+            
             for i, p in enumerate(plan["o_params"]):
                 if p.grad is not None:
-                    p.grad.copy_(G[i], non_blocking=True)
+                    p.grad.copy_(G_new[i], non_blocking=True)
 
+        # --- 3. FC Expansions ---
         if plan["g_fc"] is not None:
             G = plan["g_fc"]
             for i, p in enumerate(plan["fc_params"]):
@@ -240,11 +241,14 @@ class Muon(torch.optim.Optimizer):
                     G[i].zero_()
                 else:
                     G[i].copy_(p.grad, non_blocking=True)
-            torch.bmm(G, plan["inv_fc"], out=G)
+            
+            G_new = apply_woodbury_batched(G, plan["V_fc"], plan["D_fc"])
+            
             for i, p in enumerate(plan["fc_params"]):
                 if p.grad is not None:
-                    p.grad.copy_(G[i], non_blocking=True)
+                    p.grad.copy_(G_new[i], non_blocking=True)
 
+        # --- 4. Proj Contractions (Блочная структура) ---
         if plan["g_proj"] is not None:
             Gp = plan["g_proj"]
             for i, p in enumerate(plan["proj_params"]):
@@ -254,26 +258,35 @@ class Muon(torch.optim.Optimizer):
                     Gp[i].copy_(p.grad, non_blocking=True)
 
             n = Gp.size(0)
+            d = plan["d"]
+            k = plan["rank"]
 
-            dst_in = plan["tmp_blocks_in"].view(n, 4, d, d)
-            src_in = Gp.view(n, d, 4, d).permute(0, 2, 1, 3)  # [n,4,d,d] (strided)
-            dst_in.copy_(src_in)
+            # Пересобираем Gp из [n, d, 4*d] в плоский батч независимых блоков [n*4, d, d].
+            # permute(0, 2, 1, 3) делает хитрое транспонирование, чтобы блоки выстроились подряд.
+            G_blocks = Gp.view(n, d, 4, d).permute(0, 2, 1, 3).reshape(n * 4, d, d)
+            
+            # Разворачиваем V и D в плоский батч, чтобы совпасть с G_blocks
+            V_blocks = plan["V_proj4"].view(n * 4, d, k)
+            D_blocks = plan["D_proj4"].view(n * 4, k)
 
-            B = plan["inv_proj4"].view(n * 4, d, d)
-            torch.bmm(plan["tmp_blocks_in"], B, out=plan["tmp_proj_blocks"])
+            # Применяем Вудбери ко всем 4*n блокам одновременно (максимальная загрузка GPU)
+            G_new_blocks = apply_woodbury_batched(G_blocks, V_blocks, D_blocks)
 
-            src_out = plan["tmp_proj_blocks"].view(n, 4, d, d).permute(0, 2, 1, 3)  # [n,d,4,d]
-            Gp.view(n, d, 4, d).copy_(src_out)
+            # Собираем независимые блоки обратно в единый тензор градиента [n, d, 4*d]
+            G_new = G_new_blocks.view(n, 4, d, d).permute(0, 2, 1, 3).reshape(n, d, 4 * d)
 
             for i, p in enumerate(plan["proj_params"]):
                 if p.grad is not None:
-                    p.grad.copy_(Gp[i], non_blocking=True)
+                    p.grad.copy_(G_new[i], non_blocking=True)
 
     @torch.no_grad()
     def _finalize_precond_buffers_(self):
         if self._precond_ready:
             return
 
+        # Ранг аппроксимации (лучше вынести в __init__, но пока захардкодим для наглядности)
+        rank = 128 
+        
         refresh_map = []
         qkv_params, o_params, fc_params, proj_params = [], [], [], []
 
@@ -284,6 +297,7 @@ class Muon(torch.optim.Optimizer):
             if kind in ("qkv", "o", "c_fc"):
                 refresh_map.append((p, kind, -1))
             elif kind == "c_proj":
+                # Для c_proj сохраняем логику 4 независимых блоков
                 for j in range(4):
                     refresh_map.append((p, kind, j))
 
@@ -298,6 +312,9 @@ class Muon(torch.optim.Optimizer):
 
         self._refresh_map = refresh_map
         d = int(self._precond_d) if self._precond_d is not None else 0
+        
+        # Буфер _refresh_K остается полным (d x d), так как он нужен 
+        # исключительно как временный тензор для передачи ковариации в метод _refresh...
         self._refresh_K = None if not refresh_map else torch.empty(
             (len(refresh_map), d, d),
             device=refresh_map[0][0].device,
@@ -312,51 +329,69 @@ class Muon(torch.optim.Optimizer):
                 return None
             return torch.empty((n, out_mult * d, d), device=dev, dtype=torch.float32)
 
+        # Вспомогательные функции для выделения памяти под низкоранговые компоненты
+        def alloc_V_buf(n, dim_in, k):
+            if n == 0: return None
+            return torch.empty((n, dim_in, k), device=dev, dtype=torch.float32)
+            
+        def alloc_D_buf(n, k):
+            if n == 0: return None
+            return torch.empty((n, k), device=dev, dtype=torch.float32)
+
         plan = {
             "d": d,
+            "rank": rank,
             "qkv_params": qkv_params,
             "o_params": o_params,
             "fc_params": fc_params,
             "proj_params": proj_params,
 
+            # Буферы под сырые градиенты остаются без изменений
             "g_qkv": alloc_grad_buf(qkv_params, 3),
             "g_o":   alloc_grad_buf(o_params,   1),
             "g_fc":  alloc_grad_buf(fc_params,  4),
-
-            "inv_qkv": torch.empty((len(qkv_params), d, d), device=dev, dtype=torch.float32) if qkv_params else None,
-            "inv_o":   torch.empty((len(o_params),   d, d), device=dev, dtype=torch.float32) if o_params else None,
-            "inv_fc":  torch.empty((len(fc_params),  d, d), device=dev, dtype=torch.float32) if fc_params else None,
-
             "g_proj": torch.empty((len(proj_params), d, 4 * d), device=dev, dtype=torch.float32) if proj_params else None,
-            "inv_proj4": torch.empty((len(proj_params), 4, d, d), device=dev, dtype=torch.float32) if proj_params else None,
-            "tmp_proj_blocks": torch.empty((len(proj_params) * 4, d, d), device=dev, dtype=torch.float32) if proj_params else None,
-            "tmp_blocks_in":   torch.empty((len(proj_params) * 4, d, d), device=dev, dtype=torch.float32) if proj_params else None,
+
+            # --- ЗАМЕНА ПОЛНЫХ МАТРИЦ (inv_*) НА НИЗКОРАНГОВЫЕ (V_* и D_*) ---
+            "V_qkv": alloc_V_buf(len(qkv_params), d, rank),
+            "D_qkv": alloc_D_buf(len(qkv_params), rank),
+            
+            "V_o":   alloc_V_buf(len(o_params), d, rank),
+            "D_o":   alloc_D_buf(len(o_params), rank),
+            
+            "V_fc":  alloc_V_buf(len(fc_params), d, rank),
+            "D_fc":  alloc_D_buf(len(fc_params), rank),
+
+            # Для c_proj выделяем 4 блока векторов
+            "V_proj4": torch.empty((len(proj_params), 4, d, rank), device=dev, dtype=torch.float32) if proj_params else None,
+            "D_proj4": torch.empty((len(proj_params), 4, rank), device=dev, dtype=torch.float32) if proj_params else None,
+            
+            # Мы удалили tmp_proj_blocks и tmp_blocks_in, так как для Вудбери 
+            # они не понадобятся в том виде, в котором использовались раньше.
         }
         self._apply_plan = plan
 
-        if plan["inv_qkv"] is not None:
-            plan["inv_qkv"].zero_()
-            plan["inv_qkv"].diagonal(dim1=-2, dim2=-1).fill_(1.0)
+        # Раздаем ссылки на новые тензоры V и D в state параметров, 
+        # чтобы _refresh_precond_all_batched_ мог писать прямо в них.
+        if plan["V_qkv"] is not None:
             for i, p in enumerate(qkv_params):
-                self.state[p]["precond_inv_apply"] = plan["inv_qkv"][i]
+                self.state[p]["precond_V"] = plan["V_qkv"][i]
+                self.state[p]["precond_D"] = plan["D_qkv"][i]
 
-        if plan["inv_o"] is not None:
-            plan["inv_o"].zero_()
-            plan["inv_o"].diagonal(dim1=-2, dim2=-1).fill_(1.0)
+        if plan["V_o"] is not None:
             for i, p in enumerate(o_params):
-                self.state[p]["precond_inv_apply"] = plan["inv_o"][i]
+                self.state[p]["precond_V"] = plan["V_o"][i]
+                self.state[p]["precond_D"] = plan["D_o"][i]
 
-        if plan["inv_fc"] is not None:
-            plan["inv_fc"].zero_()
-            plan["inv_fc"].diagonal(dim1=-2, dim2=-1).fill_(1.0)
+        if plan["V_fc"] is not None:
             for i, p in enumerate(fc_params):
-                self.state[p]["precond_inv_apply"] = plan["inv_fc"][i]
+                self.state[p]["precond_V"] = plan["V_fc"][i]
+                self.state[p]["precond_D"] = plan["D_fc"][i]
 
-        if plan["inv_proj4"] is not None:
-            plan["inv_proj4"].zero_()
-            plan["inv_proj4"].diagonal(dim1=-2, dim2=-1).fill_(1.0)
+        if plan["V_proj4"] is not None:
             for i, p in enumerate(proj_params):
-                self.state[p]["precond_inv_apply"] = plan["inv_proj4"][i]
+                self.state[p]["precond_V"] = plan["V_proj4"][i]
+                self.state[p]["precond_D"] = plan["D_proj4"][i]
 
         self._precond_ready = True
 
@@ -367,6 +402,7 @@ class Muon(torch.optim.Optimizer):
 
         one_minus = 1.0 - float(precond_ewma)
 
+        # 1. Обновление ковариации (EWMA) остается без изменений
         for p, stref in self._iter_params_with_stats_():
             st = self.state[p]
             kind = st["precond_kind"]
@@ -387,6 +423,7 @@ class Muon(torch.optim.Optimizer):
         K = self._refresh_K
         d = int(self._precond_d)
 
+        # Собираем все матрицы K в один батч-тензор
         for i, (p, kind, sub) in enumerate(self._refresh_map):
             st = self.state[p]
             if kind in ("qkv", "o", "c_fc"):
@@ -394,30 +431,55 @@ class Muon(torch.optim.Optimizer):
             else:
                 K[i].copy_(st["precond_cov"][sub])
 
-        diag = K.diagonal(dim1=-2, dim2=-1)
-        if self.use_frob_gamma:
-            frob = torch.linalg.matrix_norm(K, ord='fro', dim=(-2, -1))  # shape [n]
-            ridge = (frob / (float(d) ** 0.5)) * self.precond_ridge_mult + self.precond_eps
-        else:
-            ridge = (diag.sum(dim=-1) / float(d)) * self.precond_ridge_mult + self.precond_eps
-        diag.add_(ridge.unsqueeze(-1))
+        # --- НАЧАЛО НОВОГО БЛОКА: Батчевое Randomized SVD ---
+        # В идеале эти параметры передаются через __init__ оптимизатора
+        rank = 128            # k: Целевой ранг (топ-компоненты)
+        eps = 1e-5            # Шумовой пол (значительно меньше, чем старый ridge)
+        n_power_iter = 1      # Количество степенных итераций
+        oversample = 10       # Запас для стабильности rSVD
+        
+        B = K.size(0)
+        k_opt = min(rank + oversample, d)
+        
+        # Генерация случайной матрицы Омега
+        Omega = torch.randn(B, d, k_opt, device=K.device, dtype=K.dtype)
+        
+        # Степенные итерации (Power iterations)
+        for _ in range(n_power_iter):
+            Omega = torch.bmm(K, Omega)
+            Omega, _ = torch.linalg.qr(Omega) # Батчевая ортогонализация
+            
+        # Проекция ковариации в малое подпространство: B_mat (B, k_opt, k_opt)
+        B_mat = torch.bmm(Omega.mT, torch.bmm(K, Omega))
+        
+        # Точное спектральное разложение малых матриц
+        L, W = torch.linalg.eigh(B_mat)
+        
+        # torch.linalg.eigh возвращает значения по возрастанию. 
+        # Нам нужны топ-k (самые большие), поэтому берем срез с конца.
+        L_topk = L[:, -rank:]             # (B, rank)
+        W_topk = W[:, :, -rank:]          # (B, k_opt, rank)
+        
+        # Восстанавливаем главные векторы в исходном пространстве: V (B, d, rank)
+        V = torch.bmm(Omega, W_topk)      
+        
+        # Вычисляем диагональ матрицы D для тождества Вудбери.
+        # Математически: D = 1 / (eps * L^{-1} + 1). 
+        # Алгебраический трюк для стабильности: D = L / (eps + L)
+        D = L_topk / (eps + L_topk)       # (B, rank)
+        # --- КОНЕЦ НОВОГО БЛОКА ---
 
-        L, info = torch.linalg.cholesky_ex(K, upper=False, check_errors=False)
-        torch.cholesky_inverse(L, upper=False, out=K)
-
-        if info.numel() == K.size(0):
-            bad = info != 0
-            if bad.any():
-                K[bad].zero_()
-                K[bad].diagonal(dim1=-2, dim2=-1).fill_(1.0)
-
+        # Раздаем результаты (V и D) обратно в стейты параметров.
         for i, (p, kind, sub) in enumerate(self._refresh_map):
             st = self.state[p]
-            inv_i = K[i]
+            # Внимание: В методе _finalize_precond_buffers_ 
+            # нужно создать precond_V и precond_D вместо precond_inv_apply
             if kind in ("qkv", "o", "c_fc"):
-                st["precond_inv_apply"].copy_(inv_i)
+                st["precond_V"].copy_(V[i])
+                st["precond_D"].copy_(D[i])
             else:
-                st["precond_inv_apply"][sub].copy_(inv_i)
+                st["precond_V"][sub].copy_(V[i])
+                st["precond_D"][sub].copy_(D[i])
 
     def step(self):
         do_refresh, precond_ewma, lr_mult = self._regime_schedule_(self.global_step)
@@ -431,8 +493,6 @@ class Muon(torch.optim.Optimizer):
             for _, stref in self._iter_params_with_stats_():
                 stref["accum"].zero_()
                 stref["count"].zero_()
-            if self.use_path_interval:
-                self._accum_path = 0.0  # сбрасываем после refresh
 
         self._apply_precond_all_grads_batched_()
 
@@ -461,9 +521,6 @@ class Muon(torch.optim.Optimizer):
                     scale = max(g.size(0), g.size(1))**0.5
                 p.data.add_(g, alpha=-lr * scale)
 
-        # накопленный путь = сумма реально применённого lr (с учётом scheduler).
-        # path_threshold подбирается под средний lr (см. instantiation).
-        self._accum_path += float(self.param_groups[0]['lr'])
         self.global_step += 1
 
 # -----------------------------------------------------------------------------
@@ -762,17 +819,7 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
                                weight_decay=args.weight_decay, fused=True)
-optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95,
-                  # NM-both: Frob γ + path-based refresh одновременно.
-                  # threshold=0.013: на плато тот же rate что у авторов (refresh каждые 32),
-                  # на warmdown — реже (см. _interval.py).
-                  # ridge_mult=0.02: Frob-эквивалент trace=0.2 со scale ÷10
-                  # (мини-трансформер дал оптимум 0.005-0.03 для Frob).
-                  # ОСТОРОЖНО: на мини-трансформере NM-both проиграл NM-base (t=2.95), но
-                  # тогда threshold был агрессивный 0.40 — сейчас 0.013 консервативнее.
-                  use_frob_gamma=True, use_path_interval=True,
-                  precond_ridge_mult=0.02,
-                  path_threshold=0.013)
+optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95)
 optimizer2.attach_preconditioner()
 optimizers = [optimizer1, optimizer2]
 

@@ -763,16 +763,12 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
                                weight_decay=args.weight_decay, fused=True)
 optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95,
-                  # NM-both: Frob γ + path-based refresh одновременно.
-                  # threshold=0.013: на плато тот же rate что у авторов (refresh каждые 32),
-                  # на warmdown — реже (см. _interval.py).
-                  # ridge_mult=0.02: Frob-эквивалент trace=0.2 со scale ÷10
-                  # (мини-трансформер дал оптимум 0.005-0.03 для Frob).
-                  # ОСТОРОЖНО: на мини-трансформере NM-both проиграл NM-base (t=2.95), но
-                  # тогда threshold был агрессивный 0.40 — сейчас 0.013 консервативнее.
-                  use_frob_gamma=True, use_path_interval=True,
-                  precond_ridge_mult=0.02,
-                  path_threshold=0.013)
+                  # NM-gamma: damping по Frobenius норме K вместо trace.
+                  # ridge_mult=0.02 ≈ их дефолт 0.2 / 10. На мини-трансформере (1500 шагов)
+                  # оптимум Frob-γ был 0.005-0.03; авторский trace-γ=0.2 примерно в 6-7×
+                  # больше нашего trace-оптимума, поэтому Frob-эквивалент = 0.2/(6..10).
+                  use_frob_gamma=True,
+                  precond_ridge_mult=0.02)
 optimizer2.attach_preconditioner()
 optimizers = [optimizer1, optimizer2]
 

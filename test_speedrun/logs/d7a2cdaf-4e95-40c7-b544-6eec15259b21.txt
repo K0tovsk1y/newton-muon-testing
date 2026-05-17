@@ -1,3 +1,4 @@
+====================================================================================================
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -763,16 +764,12 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
                                weight_decay=args.weight_decay, fused=True)
 optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95,
-                  # NM-both: Frob γ + path-based refresh одновременно.
-                  # threshold=0.013: на плато тот же rate что у авторов (refresh каждые 32),
-                  # на warmdown — реже (см. _interval.py).
-                  # ridge_mult=0.02: Frob-эквивалент trace=0.2 со scale ÷10
-                  # (мини-трансформер дал оптимум 0.005-0.03 для Frob).
-                  # ОСТОРОЖНО: на мини-трансформере NM-both проиграл NM-base (t=2.95), но
-                  # тогда threshold был агрессивный 0.40 — сейчас 0.013 консервативнее.
-                  use_frob_gamma=True, use_path_interval=True,
-                  precond_ridge_mult=0.02,
-                  path_threshold=0.013)
+                  # NM-gamma: damping по Frobenius норме K вместо trace.
+                  # ridge_mult=0.02 ≈ их дефолт 0.2 / 10. На мини-трансформере (1500 шагов)
+                  # оптимум Frob-γ был 0.005-0.03; авторский trace-γ=0.2 примерно в 6-7×
+                  # больше нашего trace-оптимума, поэтому Frob-эквивалент = 0.2/(6..10).
+                  use_frob_gamma=True,
+                  precond_ridge_mult=0.02)
 optimizer2.attach_preconditioner()
 optimizers = [optimizer1, optimizer2]
 
@@ -874,3 +871,76 @@ for step in range(args.num_iterations + 1):
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+====================================================================================================
+Running pytorch 2.10.0+cu128 compiled for CUDA 12.8
+nvidia-smi:
+Sun May 17 13:19:31 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 575.57.08              Driver Version: 575.57.08      CUDA Version: 12.9     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA A100-PCIE-40GB          Off |   00000000:01:00.0 Off |                    0 |
+| N/A   28C    P0             32W /  250W |       0MiB /  40960MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 2080 Ti     Off |   00000000:02:00.0 Off |                  N/A |
+| 27%   25C    P8             21W /  250W |       1MiB /  11264MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA A100-SXM4-80GB          Off |   00000000:03:00.0 Off |                    0 |
+| N/A   32C    P0             42W /  400W |       0MiB /  81920MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA A100-PCIE-40GB          Off |   00000000:04:00.0 Off |                    0 |
+| N/A   27C    P0             34W /  250W |       0MiB /  40960MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA A100-SXM4-80GB          Off |   00000000:05:00.0 Off |                    0 |
+| N/A   69C    P0             68W /  400W |    2533MiB /  81920MiB |      6%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA A100-PCIE-40GB          Off |   00000000:06:00.0 Off |                    0 |
+| N/A   33C    P0             35W /  250W |    6371MiB /  40960MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA A100-PCIE-40GB          Off |   00000000:07:00.0 Off |                    0 |
+| N/A   32C    P0             37W /  250W |   15199MiB /  40960MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA GeForce RTX 2080 Ti     Off |   00000000:08:00.0 Off |                  N/A |
+| 27%   24C    P8              9W /  250W |       1MiB /  11264MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    4   N/A  N/A         4055921      C   python                                 2524MiB |
+|    5   N/A  N/A         1914838      C   python                                 3542MiB |
+|    5   N/A  N/A         3571005      C   python                                 2812MiB |
+|    6   N/A  N/A          933516      C   VLLM::EngineCore                      15190MiB |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+step:0/6200 val_loss:10.9539 train_time:247ms step_avg:nanms
+step:1/6200 train_loss:10.9576 train_time:174011ms step_avg:nanms
+step:2/6200 train_loss:8.9523 train_time:177177ms step_avg:nanms
+step:3/6200 train_loss:7.7887 train_time:180392ms step_avg:nanms
+step:4/6200 train_loss:7.7296 train_time:183636ms step_avg:nanms
+step:5/6200 train_loss:7.3291 train_time:186887ms step_avg:nanms
+step:6/6200 train_loss:7.7762 train_time:190141ms step_avg:nanms
+step:7/6200 train_loss:7.2078 train_time:193406ms step_avg:nanms
+step:8/6200 train_loss:7.1141 train_time:196694ms step_avg:nanms
+step:9/6200 train_loss:6.7396 train_time:200006ms step_avg:nanms
+step:10/6200 train_loss:6.8174 train_time:203346ms step_avg:nanms
+step:11/6200 train_loss:6.6234 train_time:206719ms step_avg:nanms
+step:12/6200 train_loss:6.6787 train_time:210106ms step_avg:nanms
+step:13/6200 train_loss:6.7141 train_time:213519ms step_avg:nanms
+step:14/6200 train_loss:6.4539 train_time:216963ms step_avg:nanms
+step:15/6200 train_loss:6.6012 train_time:220423ms step_avg:nanms
+step:16/6200 train_loss:6.5647 train_time:223904ms step_avg:nanms
