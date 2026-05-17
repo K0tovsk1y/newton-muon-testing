@@ -763,9 +763,14 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
                                weight_decay=args.weight_decay, fused=True)
 optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95,
-                  use_frob_gamma=True, use_path_interval=True,  # NM-both
-                  precond_ridge_mult=float(os.environ.get('NM_RIDGE_MULT', '0.2')),
-                  path_threshold=float(os.environ.get('NM_PATH_THRESHOLD', '0.013')))
+                  # NM-both: Frob γ + path-based refresh одновременно. ОСТОРОЖНО — на нашем
+                  # мини-трансформере две оптимизации друг друга душили (t=2.95 хуже NM-base).
+                  # Поднимаем threshold не так агрессивно (0.05 как в _interval) и используем
+                  # тот же 0.02 для Frob. Если по итогам этого прогона хуже NM-base — гипотеза
+                  # синергии (как на GNN) не подтверждается на трансформерах.
+                  use_frob_gamma=True, use_path_interval=True,
+                  precond_ridge_mult=0.02,
+                  path_threshold=0.05)
 optimizer2.attach_preconditioner()
 optimizers = [optimizer1, optimizer2]
 

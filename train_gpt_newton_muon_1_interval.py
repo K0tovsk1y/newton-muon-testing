@@ -763,8 +763,13 @@ ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
                                weight_decay=args.weight_decay, fused=True)
 optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95,
-                  use_path_interval=True,  # NM-interval: path-based refresh
-                  path_threshold=float(os.environ.get('NM_PATH_THRESHOLD', '0.013')))
+                  # NM-interval: refresh по накопленному пути lr вместо фикс. 32 шагов.
+                  # path_threshold=0.05: интеграл lr по обучению ≈ 2.12 (плато 1.76 + warmdown 0.36),
+                  # значит ~42 refresh за обучение вместо ~194 у авторов (≈4.6× реже).
+                  # На мини-трансформере при ~7.5× реже refresh NM-interval догнал NM-base
+                  # и обогнал Muon — 0.05 это сдержанный шаг в ту сторону.
+                  use_path_interval=True,
+                  path_threshold=0.05)
 optimizer2.attach_preconditioner()
 optimizers = [optimizer1, optimizer2]
 
